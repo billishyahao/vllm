@@ -167,10 +167,18 @@ class SimpleConnector(KVConnectorBase):
 
         model_config = model_executable.model.config
         num_heads = int(model_config.num_key_value_heads / self.tp_size)
+        # num_heads = int(model_config.num_key_value_heads)
         hidden_size = model_config.hidden_size
         num_attention_heads = model_config.num_attention_heads
-        head_size = getattr(model_config, "head_dim",
-                            int(hidden_size // num_attention_heads))
+
+        if hasattr(model_config, "kv_lora_rank"):
+            head_size = model_config.kv_lora_rank + model_config.qk_rope_head_dim
+            num_heads = 1
+        else:
+            head_size = getattr(model_config, "head_dim",
+                        int(hidden_size // num_attention_heads))
+        logger.info(f"bill-dbg: head_size = {head_size}")
+        logger.info(f"bill-dbg: num_heads = {num_heads}")
 
         # query_lens contains new KV caches that are added to vLLM.
         # so we will send them to decode instance
@@ -194,8 +202,16 @@ class SimpleConnector(KVConnectorBase):
             for layer_id in range(start_layer, end_layer):
                 kv_cache = kv_caches[layer_id - start_layer]
 
-                key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
-                value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
+                # logger.info(f"bill-dbg: kv_cache[0] - kv_cache[1] = {kv_cache[0] - kv_cache[1]}")
+
+                logger.info(f"bill-dbg: before split kv_cache.shape: {kv_cache.shape}")
+
+                if hasattr(model_config, "kv_lora_rank"):
+                    key_cache = kv_cache.reshape(-1, num_heads, head_size)
+                    value_cache = kv_cache.reshape(-1, num_heads, head_size)
+                else:
+                    key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
+                    value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
 
                 current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
 
@@ -224,6 +240,8 @@ class SimpleConnector(KVConnectorBase):
         # In this case we need to do prefilling to recompute missing KV cache
         # and hidden states.
         bypass_model_exec = True
+
+        model_config = model_executable.model.config
 
         input_tokens_tensor = model_input.input_tokens
         seq_lens = model_input.attn_metadata.seq_lens
@@ -293,19 +311,49 @@ class SimpleConnector(KVConnectorBase):
                 kv_cache = kv_caches[i - model_executable.model.start_layer]
                 layer = model_executable.model.layers[i]
 
-                key_cache, value_cache = kv_cache[0], kv_cache[1]
-                ops.reshape_and_cache_flash(
-                    keys[i - model_executable.model.start_layer].to(
-                        key_cache.device),
-                    values[i - model_executable.model.start_layer].to(
-                        value_cache.device),
-                    key_cache,
-                    value_cache,
-                    slot_mapping[start_pos:end_pos],
-                    layer.self_attn.mla_attn.kv_cache_dtype,
-                    layer.self_attn.mla_attn._k_scale,
-                    layer.self_attn.mla_attn._v_scale,
-                )
+                if hasattr(model_config, "kv_lora_rank"):
+                    layer.self_attn.attn = layer.self_attn.mla_attn
+                    k_c_normed = keys[i - model_executable.model.start_layer].to(kv_cache.device)
+                    k_pe_sqz = values[i - model_executable.model.start_layer].to(kv_cache.device)
+                    k_c_normed = k_c_normed.squeeze(1)
+                    k_pe_sqz = k_pe_sqz.squeeze(1)
+                    logger.info(f"bill-dbg: k_c_normed.shape = {k_c_normed.shape}")
+                    logger.info(f"bill-dbg: k_pe_sqz.shape = {k_pe_sqz.shape}")
+                    ops.concat_and_cache_mla(
+                        k_c_normed[:, :model_config.kv_lora_rank],
+                        k_pe_sqz[:, model_config.kv_lora_rank:],
+                        kv_cache,
+                        slot_mapping[start_pos:end_pos],
+                        layer.self_attn.attn.kv_cache_dtype,
+                        layer.self_attn.attn._k_scale,
+                    )
+                else:
+
+                    key_cache, value_cache = kv_cache[0], kv_cache[1]
+                    ops.reshape_and_cache_flash(
+                        keys[i - model_executable.model.start_layer].to(
+                            key_cache.device),
+                        values[i - model_executable.model.start_layer].to(
+                            value_cache.device),
+                        key_cache,
+                        value_cache,
+                        slot_mapping[start_pos:end_pos],
+                        layer.self_attn.attn.kv_cache_dtype,
+                        layer.self_attn.attn._k_scale,
+                        layer.self_attn.attn._v_scale,
+                    )
+
+                # # write the latent and rope to kv cache
+                # if kv_cache.numel() > 0:
+                #     ops.concat_and_cache_mla(
+                #         k_c_normed,
+                #         k_pe.squeeze(1),
+                #         kv_cache,
+                #         attn_metadata.slot_mapping.flatten(),
+                #         kv_cache_dtype=self.kv_cache_dtype,
+                #         scale=layer._k_scale,
+                #     )
+
 
             hidden_or_intermediate_states_for_one_req.append(hidden)
 

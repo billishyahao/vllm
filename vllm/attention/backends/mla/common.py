@@ -1540,6 +1540,8 @@ class MLACommonImpl(MLAAttentionImpl[T], Generic[T]):
 
         # write the latent and rope to kv cache
         if kv_cache.numel() > 0:
+            # print(f"bill-dbg: k_c_normed.shape : {k_c_normed.shape}")
+            # print(f"bill-dbg: k_pe.squeeze(1).shape : {k_pe.squeeze(1).shape}")
             ops.concat_and_cache_mla(
                 k_c_normed,
                 k_pe.squeeze(1),
