@@ -156,6 +156,8 @@ class SimpleConnector(KVConnectorBase):
                                              IntermediateTensors],
     ) -> None:
 
+        # assert False
+
         input_tokens_tensor = model_input.input_tokens
         seq_lens = model_input.attn_metadata.seq_lens
         slot_mapping_flat = model_input.attn_metadata.slot_mapping.flatten()

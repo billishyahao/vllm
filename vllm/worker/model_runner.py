@@ -1660,6 +1660,12 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         num_steps: int = 1,
         **kwargs,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
+
+        logger.info(f"kv_caches shapes: ")
+        for i, t in enumerate(kv_caches):
+            logger.info(f"Bill-dbg: execute_model {i}, kv_caches {t.shape}...")
+        logger.info(f"kv_caches shapes end. ")
+        
         if num_steps > 1:
             raise ValueError("num_steps > 1 is not supported in ModelRunner")
 
@@ -1687,6 +1693,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         virtual_engine = model_input.virtual_engine
         previous_hidden_states = kwargs.get("previous_hidden_states")
         if prefill_meta is None and decode_meta.use_cuda_graph:
+            logger.info(f"bill-dbg: prefill_meta is None and decode_meta.use_cuda_graph...")
             assert model_input.input_tokens is not None
             graph_batch_size = model_input.input_tokens.shape[0]
             model_executable = self.graph_runners[virtual_engine][
@@ -1702,6 +1709,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
                                 device=previous_hidden_states.device)
                 ])
         else:
+            logger.info(f"bill-dbg: else prefill...")
             model_executable = self.model
 
         # Receive KV cache in distributed KV cache transfer setting
@@ -1756,6 +1764,7 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
         # Sending KV cache in distributed KV cache transfer setting
         # NOTE: the send operation is non-blocking
         if self.need_send_kv(model_input, kv_caches):
+            logger.info("Bill-dbg: need_send_kv %s...", model_executable)
             get_kv_transfer_group().send_kv_caches_and_hidden_states(
                 # model_executable is used to know which layer the current
                 # worker is working on, so that we can send KV for only those
