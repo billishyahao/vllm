@@ -302,9 +302,9 @@ class SimpleConnector(KVConnectorBase):
                     key_cache,
                     value_cache,
                     slot_mapping[start_pos:end_pos],
-                    layer.self_attn.attn.kv_cache_dtype,
-                    layer.self_attn.attn._k_scale,
-                    layer.self_attn.attn._v_scale,
+                    layer.self_attn.mla_attn.kv_cache_dtype,
+                    layer.self_attn.mla_attn._k_scale,
+                    layer.self_attn.mla_attn._v_scale,
                 )
 
             hidden_or_intermediate_states_for_one_req.append(hidden)
