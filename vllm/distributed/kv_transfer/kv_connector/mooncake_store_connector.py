@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """
 MooncakeStore Connector for Distributed Machine Learning Inference
-
 The MooncakeStoreConnector transfers KV caches between prefill vLLM workers
 (KV cache producer) and decode vLLM workers (KV cache consumer) using a
 database-style KVStore.
 """
 import hashlib
+import vllm.envs as envs
 from typing import TYPE_CHECKING, List, Tuple, Union
 
 import torch
@@ -33,6 +33,8 @@ class MooncakeStoreConnector(KVConnectorBase):
     ):
         self.config = config.kv_transfer_config
         self.tp_size = config.parallel_config.tensor_parallel_size
+        self.is_deepseek_mla = config.model_config.is_deepseek_mla
+        self.use_mla_opt = not envs.VLLM_MLA_DISABLE
 
         self.local_tp_rank = local_rank
 
@@ -85,7 +87,16 @@ class MooncakeStoreConnector(KVConnectorBase):
         num_heads = int(model_config.num_key_value_heads / self.tp_size)
         hidden_size = model_config.hidden_size
         num_attention_heads = model_config.num_attention_heads
-        head_size = int(hidden_size / num_attention_heads)
+        if self.is_deepseek_mla and self.use_mla_opt:
+            head_size = model_config.kv_lora_rank + \
+                model_config.qk_rope_head_dim
+            num_heads = 1
+        elif self.is_deepseek_mla and not self.use_mla_opt:
+            head_size = model_config.qk_nope_head_dim + \
+                model_config.qk_rope_head_dim
+        else:
+            head_size = getattr(model_config, "head_dim",
+                                int(hidden_size // num_attention_heads))
 
         for idx, slen in enumerate(seq_lens):
             start_pos = sum(seq_lens[:idx])
@@ -98,8 +109,12 @@ class MooncakeStoreConnector(KVConnectorBase):
             for layer_id in range(start_layer, end_layer):
                 kv_cache = kv_caches[layer_id - start_layer]
 
-                key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
-                value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
+                if self.is_deepseek_mla and self.use_mla_opt:
+                    key_cache = kv_cache.reshape(-1, num_heads, head_size)
+                    value_cache = kv_cache.reshape(-1, num_heads, head_size)
+                else:
+                    key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
+                    value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
 
                 current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
 
@@ -111,6 +126,7 @@ class MooncakeStoreConnector(KVConnectorBase):
             kvcache_to_sent = torch.stack((keys, values), dim=0)
             store_kvcache_key = f"{store_key_prefix}_{self.local_tp_rank}"
             self.kv_store.put(store_kvcache_key, kvcache_to_sent)
+            logger.info(f"bill-dbg: kvcache_to_sent.shape: {kvcache_to_sent.shape}")
 
             hidden_key = f"{store_key_prefix}_hidden_{self.local_tp_rank}"
             self.kv_store.put(hidden_key,
@@ -125,6 +141,7 @@ class MooncakeStoreConnector(KVConnectorBase):
     ) -> Tuple[Union[torch.Tensor, IntermediateTensors], bool,
                "ModelInputForGPUWithSamplingMetadata"]:
         bypass_model_exec = True
+        model_config = model_executable.model.config
         input_tokens_tensor = model_input.input_tokens
         seq_lens = model_input.attn_metadata.seq_lens
         num_prefill_tokens = model_input.attn_metadata.num_prefill_tokens
@@ -160,6 +177,7 @@ class MooncakeStoreConnector(KVConnectorBase):
 
             if remote_kv is None or hidden is None:
                 # didn't find any match.
+                logger.info(f"remote_kv is {remote_kv} or hidden is {hidden}")
                 bypass_model_exec = False
                 continue
 
@@ -173,22 +191,47 @@ class MooncakeStoreConnector(KVConnectorBase):
                 layer = model_executable.model.layers[layer_id]
                 # get kvcache object
                 kv_cache = kv_caches[layer_id - start_layer]
-                key_cache, value_cache = kv_cache[0], kv_cache[1]
+
+                logger.info(f"bill-dbg: kv_cache.shape: {kv_cache.shape}")
                 # get remote kvcache
 
-                remote_k, remote_v = remote_kv[0][layer_id], remote_kv[1][
+                # remote_k, remote_v = remote_kv[0][layer_id], remote_kv[1][
+                #     layer_id]
+
+
+                if self.is_deepseek_mla and self.use_mla_opt:
+
+                    remote_k, remote_v = remote_kv[0][layer_id], remote_kv[1][layer_id]
+                    layer.self_attn.attn = layer.self_attn.mla_attn
+                    remote_k_c_normed_k_pe = remote_k.squeeze(1)
+                    logger.info(f"bill-dbg: remote_k_c_normed_k_pe.shape: {remote_k_c_normed_k_pe.shape}")
+                    remote_k_c_normed = remote_k_c_normed_k_pe[:, :model_config.kv_lora_rank]
+                    remote_k_pe = remote_k_c_normed_k_pe[:, model_config.kv_lora_rank:]
+                    ops.concat_and_cache_mla(
+                        remote_k_c_normed.to(kv_cache.device),
+                        remote_k_pe.to(kv_cache.device),
+                        kv_cache,
+                        slot_mapping[start_pos:end_pos],
+                        layer.self_attn.attn.kv_cache_dtype,
+                        layer.self_attn.attn._k_scale,
+                    )
+                else:
+                    key_cache, value_cache = kv_cache[0], kv_cache[1]
+                    remote_k, remote_v = remote_kv[0][layer_id], remote_kv[1][
                     layer_id]
-                # use ops.reshape_and_cache_flash to put kv into kvcache
-                ops.reshape_and_cache_flash(
-                    remote_k.to(key_cache.device),
-                    remote_v.to(value_cache.device),
-                    key_cache,
-                    value_cache,
-                    slot_mapping[start_pos:end_pos],
-                    layer.self_attn.attn.kv_cache_dtype,
-                    layer.self_attn.attn._k_scale,
-                    layer.self_attn.attn._v_scale,
-                )
+                    logger.info(f"bill-dbg: remote_k.shape: {remote_k.shape}")
+                    ops.reshape_and_cache_flash(
+                        remote_k.to(
+                            key_cache.device),
+                        remote_v.to(
+                            value_cache.device),
+                        key_cache,
+                        value_cache,
+                        slot_mapping[start_pos:end_pos],
+                        layer.self_attn.attn.kv_cache_dtype,
+                        layer.self_attn.attn._k_scale,
+                        layer.self_attn.attn._v_scale,
+                    )
 
             hidden_or_intermediate_states_for_one_req.append(hidden)
 
