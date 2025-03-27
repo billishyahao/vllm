@@ -16,6 +16,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
+from .model_aware_kv_ops import kv_helper
 
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUWithSamplingMetadata
@@ -32,10 +33,7 @@ class MooncakeStoreConnector(KVConnectorBase):
         config: VllmConfig,
     ):
         self.config = config.kv_transfer_config
-        self.tp_size = config.parallel_config.tensor_parallel_size
-        self.is_deepseek_mla = config.model_config.is_deepseek_mla
-        self.use_mla_opt = not envs.VLLM_MLA_DISABLE
-
+        self.kv_helper = kv_helper(config)
         self.local_tp_rank = local_rank
 
         # Init kv_store
@@ -82,21 +80,7 @@ class MooncakeStoreConnector(KVConnectorBase):
         slot_mapping_flat = model_input.attn_metadata.slot_mapping.flatten()
         start_layer = model_executable.model.start_layer
         end_layer = model_executable.model.end_layer
-
-        model_config = model_executable.model.config
-        num_heads = int(model_config.num_key_value_heads / self.tp_size)
-        hidden_size = model_config.hidden_size
-        num_attention_heads = model_config.num_attention_heads
-        if self.is_deepseek_mla and self.use_mla_opt:
-            head_size = model_config.kv_lora_rank + \
-                model_config.qk_rope_head_dim
-            num_heads = 1
-        elif self.is_deepseek_mla and not self.use_mla_opt:
-            head_size = model_config.qk_nope_head_dim + \
-                model_config.qk_rope_head_dim
-        else:
-            head_size = getattr(model_config, "head_dim",
-                                int(hidden_size // num_attention_heads))
+        num_heads, head_size = self.kv_helper.get_model_args(model_executable)
 
         for idx, slen in enumerate(seq_lens):
             start_pos = sum(seq_lens[:idx])
@@ -108,14 +92,7 @@ class MooncakeStoreConnector(KVConnectorBase):
 
             for layer_id in range(start_layer, end_layer):
                 kv_cache = kv_caches[layer_id - start_layer]
-
-                if self.is_deepseek_mla and self.use_mla_opt:
-                    key_cache = kv_cache.reshape(-1, num_heads, head_size)
-                    value_cache = kv_cache.reshape(-1, num_heads, head_size)
-                else:
-                    key_cache = kv_cache[0].reshape(-1, num_heads, head_size)
-                    value_cache = kv_cache[1].reshape(-1, num_heads, head_size)
-
+                key_cache, value_cache = self.kv_helper.get_key_value_cache(kv_cache, num_heads, head_size)
                 current_slot_mapping = slot_mapping_flat[start_pos:end_pos]
 
                 keys.append(key_cache[current_slot_mapping].unsqueeze(0))
@@ -141,7 +118,7 @@ class MooncakeStoreConnector(KVConnectorBase):
     ) -> Tuple[Union[torch.Tensor, IntermediateTensors], bool,
                "ModelInputForGPUWithSamplingMetadata"]:
         bypass_model_exec = True
-        model_config = model_executable.model.config
+        # model_config = model_executable.model.config
         input_tokens_tensor = model_input.input_tokens
         seq_lens = model_input.attn_metadata.seq_lens
         num_prefill_tokens = model_input.attn_metadata.num_prefill_tokens
@@ -177,7 +154,6 @@ class MooncakeStoreConnector(KVConnectorBase):
 
             if remote_kv is None or hidden is None:
                 # didn't find any match.
-                logger.info(f"remote_kv is {remote_kv} or hidden is {hidden}")
                 bypass_model_exec = False
                 continue
 
@@ -198,40 +174,14 @@ class MooncakeStoreConnector(KVConnectorBase):
                 # remote_k, remote_v = remote_kv[0][layer_id], remote_kv[1][
                 #     layer_id]
 
-
-                if self.is_deepseek_mla and self.use_mla_opt:
-
-                    remote_k, remote_v = remote_kv[0][layer_id], remote_kv[1][layer_id]
-                    layer.self_attn.attn = layer.self_attn.mla_attn
-                    remote_k_c_normed_k_pe = remote_k.squeeze(1)
-                    logger.info(f"bill-dbg: remote_k_c_normed_k_pe.shape: {remote_k_c_normed_k_pe.shape}")
-                    remote_k_c_normed = remote_k_c_normed_k_pe[:, :model_config.kv_lora_rank]
-                    remote_k_pe = remote_k_c_normed_k_pe[:, model_config.kv_lora_rank:]
-                    ops.concat_and_cache_mla(
-                        remote_k_c_normed.to(kv_cache.device),
-                        remote_k_pe.to(kv_cache.device),
-                        kv_cache,
-                        slot_mapping[start_pos:end_pos],
-                        layer.self_attn.attn.kv_cache_dtype,
-                        layer.self_attn.attn._k_scale,
-                    )
-                else:
-                    key_cache, value_cache = kv_cache[0], kv_cache[1]
-                    remote_k, remote_v = remote_kv[0][layer_id], remote_kv[1][
-                    layer_id]
-                    logger.info(f"bill-dbg: remote_k.shape: {remote_k.shape}")
-                    ops.reshape_and_cache_flash(
-                        remote_k.to(
-                            key_cache.device),
-                        remote_v.to(
-                            value_cache.device),
-                        key_cache,
-                        value_cache,
-                        slot_mapping[start_pos:end_pos],
-                        layer.self_attn.attn.kv_cache_dtype,
-                        layer.self_attn.attn._k_scale,
-                        layer.self_attn.attn._v_scale,
-                    )
+                self.kv_helper.put_kv_to_cache_from_mooncake(model_executable,
+                                                             remote_kv,
+                                                             layer,
+                                                             layer_id,
+                                                             kv_cache,
+                                                             slot_mapping,
+                                                             start_pos,
+                                                             end_pos)
 
             hidden_or_intermediate_states_for_one_req.append(hidden)
 
