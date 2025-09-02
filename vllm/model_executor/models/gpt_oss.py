@@ -11,10 +11,11 @@ from transformers import GptOssConfig
 from vllm.attention import Attention, AttentionType
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (get_ep_group, get_pp_group,
+from vllm.distributed import (get_dp_group, get_ep_group, get_pp_group,
                               get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                RowParallelLinear)
@@ -27,6 +28,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.sampling_metadata import SamplingMetadata
 from vllm.sequence import IntermediateTensors
 from vllm.utils import cdiv
+
 
 from .interfaces import SupportsPP
 from .utils import (AutoWeightsLoader, WeightsMapper, extract_layer_index,
@@ -222,6 +224,7 @@ class GptOssModel(nn.Module):
         self.cache_config = vllm_config.cache_config
         self.quant_config = vllm_config.quant_config
         self.parallel_config = vllm_config.parallel_config
+
         self.config.hidden_size = self.config.hidden_size
         self.embedding = VocabParallelEmbedding(
             self.config.vocab_size,
@@ -292,7 +295,17 @@ class GptOssModel(nn.Module):
         num_experts = self.config.num_local_experts
 
         tp_rank = get_tensor_model_parallel_rank()
-        tp_size = get_tensor_model_parallel_world_size()
+        tp_size_ = get_tensor_model_parallel_world_size()
+        dp_size_ = get_dp_group().world_size
+
+        moe_parallel_config = FusedMoEParallelConfig.make(
+                tp_size_=tp_size_,
+                dp_size_=dp_size_,
+                vllm_parallel_config=self.parallel_config)
+        
+        tp_size = moe_parallel_config.tp_size
+
+        print(f"bill-dbg: tp_size: {tp_size}")
 
         intermediate_size = self.config.intermediate_size
         intermediate_size_block = intermediate_size // mxfp4_block
@@ -384,6 +397,9 @@ class GptOssModel(nn.Module):
                 # uint8, divide by 2
                 weight = weight.view(num_experts, -1,
                                      intermediate_size // 2).contiguous()
+                # print(f"bill-dbg: weight: {weight.size()}")
+
+
                 if use_ep:
                     narrow_weight = weight[ep_rank_start:ep_rank_end, ...]
                 else:
