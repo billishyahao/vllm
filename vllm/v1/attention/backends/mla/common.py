@@ -1655,13 +1655,21 @@ class MLACommonImpl(MLAAttentionImpl[M], Generic[M]):
                 # decode_q do allgather in head dim.
                 decode_q = get_dcp_group().all_gather(decode_q, dim=1)
 
+            # print(f"bill-dbg: MLACommonImpl.forward before _forward_decode: {decode_q.shape=}")
+
             # call decode attn
             attn_out, lse = self._forward_decode(decode_q, kv_cache,
                                                  attn_metadata, layer)
+            
+            # print(f"bill-dbg: MLACommonImpl.forward after _forward_decode: {attn_out.shape=}")
+
 
             # recorect dcp attn_out with lse.
             if self.dcp_world_size > 1:
                 attn_out = cp_lse_ag_out_rs(attn_out, lse, get_dcp_group())
+
+            # print(f"bill-dbg: MLACommonImpl.forward after ag {attn_out.shape=}")
+            
 
             # v_up projection
             self._v_up_proj(attn_out, out=output[:num_decode_tokens])

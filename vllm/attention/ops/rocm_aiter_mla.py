@@ -29,6 +29,7 @@ def aiter_mla_decode_fwd(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
     o: torch.Tensor,
+    lse: torch.Tensor,
     sm_scale: float,
     qo_indptr: torch.Tensor,
     max_seqlen_qo: int,
@@ -42,6 +43,7 @@ def aiter_mla_decode_fwd(
                                              kv_buffer.view(
                                                  -1, 1, 1, q.shape[-1]),
                                              o,
+                                             lse,
                                              qo_indptr,
                                              max_seqlen_qo,
                                              kv_indptr,
@@ -55,6 +57,7 @@ def mla_decode_fwd_impl(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
     o: torch.Tensor,
+    lse: torch.Tensor,
     qo_indptr: torch.Tensor,
     max_seqlen_qo: int,
     kv_indptr: Optional[torch.Tensor] = None,
@@ -65,7 +68,7 @@ def mla_decode_fwd_impl(
 ) -> None:
     from aiter.mla import mla_decode_fwd
 
-    mla_decode_fwd(q,
+    logits, attn_lse = mla_decode_fwd(q,
                    kv_buffer.view(-1, 1, 1, q.shape[-1]),
                    o,
                    qo_indptr,
@@ -75,12 +78,22 @@ def mla_decode_fwd_impl(
                    max_seqlen_qo,
                    sm_scale=sm_scale,
                    logit_cap=logit_cap)
+    # attn_lse = attn_lse.squeeze(-1).squeeze(1)
+    # lse.shape=torch.Size([4, 16])                                                                                                                                                                                                                                     
+    # attn_lse.shape=torch.Size([4, 1, 16, 1])
+     
+    # print(f"hebi-dbg: {o.shape=}")
+    # print(f"hebi-dbg: {lse.shape=}")
+    # print(f"hebi-dbg: {attn_lse.shape=}")
+    # print(f"hebi-dbg: {attn_lse.squeeze(-1)[:, -1, :].shape=}")
+    lse.copy_(attn_lse.squeeze(-1)[:, -1, :])
 
 
 def mla_decode_fwd_fake(
     q: torch.Tensor,
     kv_buffer: torch.Tensor,
     o: torch.Tensor,
+    lse: torch.Tensor,
     qo_indptr: torch.Tensor,
     max_seqlen_qo: int,
     kv_indptr: Optional[torch.Tensor] = None,
@@ -99,6 +112,6 @@ if current_platform.is_rocm():
         tags = (torch.Tag.needs_fixed_stride_order, ),
     direct_register_custom_op(op_name="rocm_aiter_mla_decode_fwd",
                               op_func=mla_decode_fwd_impl,
-                              mutates_args=["o"],
+                              mutates_args=["o", "lse"],
                               fake_impl=mla_decode_fwd_fake,
                               tags=tags)

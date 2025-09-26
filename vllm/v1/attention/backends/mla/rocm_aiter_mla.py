@@ -171,6 +171,8 @@ class AiterMLAMetadataBuilder(MLACommonMetadataBuilder[AiterMLAMetadata]):
 
 class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
+    can_return_lse_for_decode: bool = True
+
     def __init__(
             self,
             num_heads: int,
@@ -235,21 +237,27 @@ class AiterMLAImpl(MLACommonImpl[AiterMLAMetadata]):
 
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
+        nH = q.shape[1]
         o = torch.zeros(B,
-                        self.num_heads,
+                        nH,
                         self.kv_lora_rank,
                         dtype=q.dtype,
                         device=q.device)
+
+        lse = torch.zeros(B,
+                          nH,
+                          dtype=q.dtype,
+                          device=q.device)
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
 
         # max_seqlen_qo must be 1 except for MTP
         # TODO: Find the best value for MTP
         max_seqlen_qo = 1
-        aiter_mla_decode_fwd(q, kv_buffer, o, self.scale,
+        aiter_mla_decode_fwd(q, kv_buffer, o, lse, self.scale,
                              attn_metadata.decode.qo_indptr, max_seqlen_qo,
                              attn_metadata.decode.paged_kv_indptr,
                              attn_metadata.decode.paged_kv_indices,
                              attn_metadata.decode.paged_kv_last_page_len)
 
-        return o, None
+        return o, lse
